@@ -19,6 +19,7 @@ import ssm.init_state_distns as isd
 import ssm.emissions as emssn
 import ssm.hmm as hmm
 import ssm.variational as varinf
+from scipy.linalg import expm
 
 __all__ = ['SLDS', 'LDS']
 
@@ -29,7 +30,7 @@ class SLDS(object):
     stochastic variational inference on the marginal model,
     integrating out the discrete states.
     """
-    def __init__(self, N, K, D, *, M=0,
+    def __init__(self, N, K, D, *, M=0, lambda_reg=2,
                  init_state_distn=None,
                  transitions="standard",
                  transition_kwargs=None,
@@ -73,6 +74,7 @@ class SLDS(object):
         dynamics_classes = dict(
             none=obs.GaussianObservations,
             gaussian=obs.AutoRegressiveObservations,
+            mygaussian=obs.cycledAutoRegressiveObservations,
             diagonal_gaussian=obs.AutoRegressiveDiagonalNoiseObservations,
             t=obs.RobustAutoRegressiveObservations,
             studentst=obs.RobustAutoRegressiveObservations,
@@ -142,6 +144,7 @@ class SLDS(object):
         self.transitions = transitions
         self.dynamics = dynamics
         self.emissions = emissions
+        self.lambda_reg = lambda_reg
 
     @property
     def params(self):
@@ -449,6 +452,10 @@ class SLDS(object):
         elp = np.sum(Ez[0] * log_pi0)
         elp += np.sum(Ezzp1 * log_Ps)
         elp += np.sum(Ez * log_likes)
+        if isinstance(self.dynamics, obs.cycledAutoRegressiveObservations):
+            for k in range(self.dynamics.K):
+                elp += self.lambda_reg * expm(self.dynamics.As[k] * self.dynamics.As[k]).trace()
+        assert np.all(np.isfinite(elp))
         assert np.all(np.isfinite(elp))
         return -1 * elp / scale
 
@@ -656,6 +663,10 @@ class SLDS(object):
                     exp_log_joint += np.sum(Ez[0] * log_pi0)
                     exp_log_joint += np.sum(Ezzp1 * log_Ps)
                     exp_log_joint += np.sum(Ez * log_likes)
+                    # print("Exp Log joint", exp_log_joint)
+                    if isinstance(self.dynamics, obs.cycledAutoRegressiveObservations):
+                        for k in range(self.dynamics.K):    
+                            exp_log_joint -= self.lambda_reg*expm(self.dynamics.As[k]*self.dynamics.As[k]).trace()
             return exp_log_joint / n_samples
 
         return estimate_expected_log_joint(n_samples) + variational_posterior.entropy()

@@ -884,6 +884,7 @@ class _AutoRegressiveObservationsBase(Observations):
             for l in range(self.lags):
                 Al = A[:, l*D:(l + 1)*D]
                 mus_k_ar = mus_k_ar + np.dot(data[self.lags-l-1:-l-1], Al.T)
+                #print(mus_k_ar)
             mus_k_ar = mus_k_ar + b
 
             # Append concatenated mean
@@ -901,6 +902,87 @@ class _AutoRegressiveObservationsBase(Observations):
         mus = np.swapaxes(self._compute_mus(data, input, mask, tag), 0, 1)
         return (expectations[:, :, None] * mus).sum(1)
 
+class _cycledAutoRegressiveObservationsBase(Observations):
+    """
+    Base class for autoregressive observations of the form,
+
+    E[x_t | x_{t-1}, z_t=k, u_t]
+        = \sum_{l=1}^{L} A_k^{(l)} x_{t-l} + b_k + V_k u_t.
+
+    where L is the number of lags and u_t is the input.
+    """
+    def __init__(self, K, D, M=0, lags=1):
+        super(_cycledAutoRegressiveObservationsBase, self).__init__(K, D, M)
+
+        # Distribution over initial point
+        self.mu_init = np.zeros((K, D))
+
+        # AR parameters
+        assert lags > 0
+        self.lags = lags
+        self.bs = npr.randn(K, D)
+        self.Vs = npr.randn(K, D, M)
+
+        # Inheriting classes may treat _As differently
+        self._As = None
+
+    @property
+    def As(self):
+        return self._As
+
+    @As.setter
+    def As(self, value):
+        self._As = value
+
+    @property
+    def params(self):
+        return self.As, self.bs, self.Vs
+
+    @params.setter
+    def params(self, value):
+        self.As, self.bs, self.Vs = value
+
+    def permute(self, perm):
+        self.mu_init = self.mu_init[perm]
+        self.As = self.As[perm]
+        self.bs = self.bs[perm]
+        self.Vs = self.Vs[perm]
+
+    def _compute_mus(self, data, input, mask, tag):
+        # assert np.all(mask), "ARHMM cannot handle missing data"
+        K, M = self.K, self.M
+        T, D = data.shape
+        As, bs, Vs, mu0s = self.As, self.bs, self.Vs, self.mu_init
+
+        # Instantaneous inputs
+        mus = np.empty((K, T, D))
+        mus = []
+        for k, (A, b, V, mu0) in enumerate(zip(As, bs, Vs, mu0s)):
+            # Initial condition
+            mus_k_init = mu0 * np.ones((self.lags, D))
+
+            # Subsequent means are determined by the AR process
+            mus_k_ar = np.dot(input[self.lags:, :M], V.T)
+            for l in range(self.lags):
+                Al = A[:, l*D:(l + 1)*D]
+                mus_k_ar = mus_k_ar + np.dot(data[self.lags-l-1:-l-1], Al.T) + np.dot(data[self.lags-l:], Al.T)
+                #print("cycled:", mus_k_ar)
+            mus_k_ar = mus_k_ar + b
+
+            # Append concatenated mean
+            mus.append(np.vstack((mus_k_init, mus_k_ar)))
+
+        return np.array(mus)
+
+    def smooth(self, expectations, data, input, tag):
+        """
+        Compute the mean observation under the posterior distribution
+        of latent discrete states.
+        """
+        T = expectations.shape[0]
+        mask = np.ones((T, self.D), dtype=bool)
+        mus = np.swapaxes(self._compute_mus(data, input, mask, tag), 0, 1)
+        return (expectations[:, :, None] * mus).sum(1)
 
 class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
     """
@@ -919,7 +1001,7 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
                  nu0=1e-4, Psi0=1e-4):
         super(AutoRegressiveObservations, self).\
             __init__(K, D, M, lags=lags)
-
+        #print("Initialized")
         # Initialize the dynamics and the noise covariances
         self._As = .80 * np.array([
                 np.column_stack([random_rotation(D), np.zeros((D, (lags-1) * D))])
@@ -1170,18 +1252,18 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
     def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
         D, As, bs, Vs = self.D, self.As, self.bs, self.Vs
-
+        #print("sample")
         if xhist.shape[0] < self.lags:
             # Sample from the initial distribution
             S = np.linalg.cholesky(self.Sigmas_init[z]) if with_noise else 0
             return self.mu_init[z] + np.dot(S, npr.randn(D))
         else:
+            #print("sample from autoregressive")
             # Sample from the autoregressive distribution
             mu = Vs[z].dot(input[:self.M]) + bs[z]
             for l in range(self.lags):
                 Al = As[z][:,l*D:(l+1)*D]
                 mu += Al.dot(xhist[-l-1])
-
             S = np.linalg.cholesky(self.Sigmas[z]) if with_noise else 0
             return mu + np.dot(S, npr.randn(D))
 
@@ -1209,6 +1291,312 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
         return J_ini, J_dyn_11, J_dyn_21, J_dyn_22
 
+class cycledAutoRegressiveObservations(_cycledAutoRegressiveObservationsBase):
+    """
+    AutoRegressive observation model with Gaussian noise.
+
+        (x_t | z_t = k, u_t) ~ N(A_k x_{t-1} + b_k + V_k u_t, S_k)
+
+    where S_k is a positive definite covariance matrix.
+
+    The parameters are fit via maximum likelihood estimation.
+    """
+    def __init__(self, K, D, M=0, lags=1,
+                 l2_penalty_A=1e-8,
+                 l2_penalty_b=1e-8,
+                 l2_penalty_V=1e-8,
+                 nu0=1e-4, Psi0=1e-4):
+        super(cycledAutoRegressiveObservations, self).\
+            __init__(K, D, M, lags=lags)
+        #print("Initialized cycled")
+        # Initialize the dynamics and the noise covariances
+        self._As = .80 * np.array([
+                np.column_stack([random_rotation(D), np.zeros((D, (lags-1) * D))])
+            for _ in range(K)])
+
+        self._sqrt_Sigmas_init = np.tile(np.eye(D)[None, ...], (K, 1, 1))
+        self._sqrt_Sigmas = npr.randn(K, D, D)
+
+        # Set natural parameters of Gaussian prior on (A, V, b) weight matrix
+        J0_diag = np.concatenate((l2_penalty_A * np.ones(D * lags),
+                                  l2_penalty_V * np.ones(M),
+                                  l2_penalty_b * np.ones(1)))
+        self.J0 = np.tile(np.diag(J0_diag)[None, :, :], (K, 1, 1))
+
+        h0 = np.concatenate((l2_penalty_A * np.eye(D),
+                             np.zeros((D * (lags - 1), D)),
+                             np.zeros((M + 1, D))))
+        self.h0 = np.tile(h0[None, :, :], (K, 1, 1))
+
+        # Set natural parameters of inverse Wishart prior on Sigma
+        self.nu0 = nu0
+        self.Psi0 = Psi0 * np.eye(D) if np.isscalar(Psi0) else Psi0
+
+        self.l2_penalty_A = l2_penalty_A
+        self.l2_penalty_b = l2_penalty_b
+        self.l2_penalty_V = l2_penalty_V
+
+    @property
+    def A(self):
+        return self.As[0]
+
+    @A.setter
+    def A(self, value):
+        assert value.shape == self.As[0].shape
+        self.As[0] = value
+
+    @property
+    def b(self):
+        return self.bs[0]
+
+    @b.setter
+    def b(self, value):
+        assert value.shape == self.bs[0].shape
+        self.bs[0] = value
+
+    @property
+    def Sigmas_init(self):
+        return np.matmul(self._sqrt_Sigmas_init, np.swapaxes(self._sqrt_Sigmas_init, -1, -2))
+
+    @Sigmas_init.setter
+    def Sigmas_init(self, value):
+        assert value.shape == (self.K, self.D, self.D)
+        self._sqrt_Sigmas_init = np.linalg.cholesky(value + 1e-8 * np.eye(self.D))
+
+    @property
+    def Sigmas(self):
+        return np.matmul(self._sqrt_Sigmas, np.swapaxes(self._sqrt_Sigmas, -1, -2))
+
+    @Sigmas.setter
+    def Sigmas(self, value):
+        assert value.shape == (self.K, self.D, self.D)
+        self._sqrt_Sigmas = np.linalg.cholesky(value + 1e-8 * np.eye(self.D))
+
+    @property
+    def params(self):
+        return super(cycledAutoRegressiveObservations, self).params + (self._sqrt_Sigmas,)
+
+    @params.setter
+    def params(self, value):
+        self._sqrt_Sigmas = value[-1]
+        super(cycledAutoRegressiveObservations, self.__class__).params.fset(self, value[:-1])
+
+    def permute(self, perm):
+        super(cycledAutoRegressiveObservations, self).permute(perm)
+        self._sqrt_Sigmas = self._sqrt_Sigmas[perm]
+
+    def log_likelihoods(self, data, input, mask, tag=None):
+        assert np.all(mask), "Cannot compute likelihood of autoregressive obsevations with missing data."
+        L = self.lags
+        mus = self._compute_mus(data, input, mask, tag)
+
+        # Compute the likelihood of the initial data and remainder separately
+        # stats.multivariate_studentst_logpdf supports broadcasting, but we get
+        # significant performance benefit if we call it with (TxD), (D,), (D,D), and (,)
+        # arrays as inputs
+        ll_init = np.column_stack([stats.multivariate_normal_logpdf(data[:L], mu[:L], Sigma)
+                               for mu, Sigma in zip(mus, self.Sigmas_init)])
+
+        ll_ar = np.column_stack([stats.multivariate_normal_logpdf(data[L:], mu[L:], Sigma)
+                               for mu, Sigma in zip(mus, self.Sigmas)])
+
+        return np.row_stack((ll_init, ll_ar))
+
+    def _get_sufficient_statistics(self, expectations, datas, inputs):
+        K, D, M, lags = self.K, self.D, self.M, self.lags
+        D_in = D * lags + M + 1
+
+        # Initialize the outputs
+        ExuxuTs = np.zeros((K, D_in, D_in))
+        ExuyTs = np.zeros((K, D_in, D))
+        EyyTs = np.zeros((K, D, D))
+        Ens = np.zeros(K)
+
+        # Iterate over data arrays and discrete states
+        for (Ez, _, _), data, input in zip(expectations, datas, inputs):
+            u = input[lags:]
+            y = data[lags:]
+            for k in range(K):
+                w = Ez[lags:, k]
+
+                # ExuxuTs[k]
+                for l1 in range(lags):
+                    x1 = data[lags-l1-1:-l1-1]
+                    # Cross terms between lagged data and other lags
+                    for l2 in range(l1, lags):
+                        x2 = data[lags - l2 - 1:-l2 - 1]
+                        ExuxuTs[k, l1*D:(l1+1)*D, l2*D:(l2+1)*D] += np.einsum('t,ti,tj->ij', w, x1, x2)
+
+                    # Cross terms between lagged data and inputs and bias
+                    ExuxuTs[k, l1*D:(l1+1)*D, D*lags:D*lags+M] += np.einsum('t,ti,tj->ij', w, x1, u)
+                    ExuxuTs[k, l1*D:(l1+1)*D, -1] += np.einsum('t,ti->i', w, x1)
+
+                ExuxuTs[k, D*lags:D*lags+M, D*lags:D*lags+M] += np.einsum('t,ti,tj->ij', w, u, u)
+                ExuxuTs[k, D*lags:D*lags+M, -1] += np.einsum('t,ti->i', w, u)
+                ExuxuTs[k, -1, -1] += np.sum(w)
+
+                # ExuyTs[k]
+                for l1 in range(lags):
+                    x1 = data[lags - l1 - 1:-l1 - 1]
+                    ExuyTs[k, l1*D:(l1+1)*D, :] += np.einsum('t,ti,tj->ij', w, x1, y)
+                ExuyTs[k, D*lags:D*lags+M, :] += np.einsum('t,ti,tj->ij', w, u, y)
+                ExuyTs[k, -1, :] += np.einsum('t,ti->i', w, y)
+
+                # EyyTs[k] and Ens[k]
+                EyyTs[k] += np.einsum('t,ti,tj->ij',w,y,y)
+                Ens[k] += np.sum(w)
+
+        # Symmetrize the expectations
+        for k in range(K):
+            for l1 in range(lags):
+                for l2 in range(l1, lags):
+                    ExuxuTs[k, l2*D:(l2+1)*D, l1*D:(l1+1)* D] = ExuxuTs[k, l1*D:(l1+1)*D, l2*D:(l2+1)*D].T
+                ExuxuTs[k, D*lags:D*lags+M, l1*D:(l1+1)*D] = ExuxuTs[k, l1*D:(l1+1)*D, D*lags:D*lags+M].T
+                ExuxuTs[k, -1, l1*D:(l1+1)*D] = ExuxuTs[k, l1*D:(l1+1)*D, -1].T
+            ExuxuTs[k, -1, D*lags:D*lags+M] = ExuxuTs[k, D*lags:D*lags+M, -1].T
+
+        return ExuxuTs, ExuyTs, EyyTs, Ens
+
+    def _extend_given_sufficient_statistics(self, expectations, continuous_expectations, inputs):
+        # Extend continuous_expectations with given inputs and discrete weights
+        assert self.lags == 1, "_extend_given_sufficient_statistics assumes lags == 1."
+        K, D, M, lags = self.K, self.D, self.M, self.lags
+        D_in = D * lags + M + 1
+
+        # Initialize the outputs
+        ExuxuTs = np.zeros((K, D_in, D_in))
+        ExuyTs = np.zeros((K, D_in, D))
+        EyyTs = np.zeros((K, D, D))
+        Ens = np.zeros(K)
+
+        for (Ez, _, _), (_, Ex, smoothed_sigmas, Exxn), u in \
+                zip(expectations, continuous_expectations, inputs):
+            ExxT = smoothed_sigmas + np.einsum('ti,tj->tij', Ex, Ex)
+            u = u[lags:]
+
+            for k in range(K):
+                w = Ez[lags:, k]
+
+                ExuxuTs[k, :D, :D] += np.einsum('t,tij->ij', w, ExxT[:-1])
+                ExuxuTs[k, :D, D:D + M] += np.einsum('t,ti,tj->ij', w, Ex[:-1], u)
+                ExuxuTs[k, :D, -1] += np.einsum('t,ti->i', w, Ex[:-1])
+                ExuxuTs[k, D:D + M, D:D + M] += np.einsum('t,ti,tj->ij', w, u, u)
+                ExuxuTs[k, D:D + M, -1] += np.einsum('t,ti->i', w, u)
+                ExuxuTs[k, -1, -1] += np.sum(w)
+
+                ExuyTs[k, :D, :] += np.einsum('t,tij->ij', w, Exxn)
+                ExuyTs[k, D:D + M, :] += np.einsum('t,ti,tj->ij', w, u, Ex[1:])
+                ExuyTs[k, -1, :] += np.einsum('t,ti->i', w, Ex[1:])
+
+                EyyTs[k] += np.einsum('t,tij->ij', w, ExxT[1:])
+                Ens[k] += np.sum(w)
+
+        # Symmetrize the expectations
+        for k in range(K):
+            ExuxuTs[k, D:D + M, :D] = ExuxuTs[k, :D, D:D + M].T
+            ExuxuTs[k, -1, :D] = ExuxuTs[k, :D, -1].T
+            ExuxuTs[k, -1, D:D + M] = ExuxuTs[k, D:D + M, -1].T
+
+        return ExuxuTs, ExuyTs, EyyTs, Ens
+
+    def m_step(self, expectations, datas, inputs, masks, tags,
+               continuous_expectations=None, **kwargs):
+        """Compute M-step for Gaussian Auto Regressive Observations.
+
+        If `continuous_expectations` is not None, this function will
+        compute an exact M-step using the expected sufficient statistics for the
+        continuous states. In this case, we ignore the prior provided by (J0, h0),
+        because the calculation is exact. `continuous_expectations` should be a tuple of
+        (Ex, Ey, ExxT, ExyT, EyyT).
+
+        If `continuous_expectations` is None, we use `datas` and `expectations,
+        and (optionally) the prior given by (J0, h0). In this case, we estimate the sufficient
+        statistics using `datas,` which is typically a single sample of the continuous
+        states from the posterior distribution.
+        """
+        K, D, M, lags = self.K, self.D, self.M, self.lags
+
+        # Collect sufficient statistics
+        if continuous_expectations is None:
+            ExuxuTs, ExuyTs, EyyTs, Ens = self._get_sufficient_statistics(expectations, datas, inputs)
+        else:
+            ExuxuTs, ExuyTs, EyyTs, Ens = \
+                self._extend_given_sufficient_statistics(expectations, continuous_expectations, inputs)
+
+        # Solve the linear regressions
+        As = np.zeros((K, D, D * lags))
+        Vs = np.zeros((K, D, M))
+        bs = np.zeros((K, D))
+        Sigmas = np.zeros((K, D, D))
+        for k in range(K):
+            Wk = np.linalg.solve(ExuxuTs[k] + self.J0[k], ExuyTs[k] + self.h0[k]).T
+            As[k] = Wk[:, :D * lags]
+            Vs[k] = Wk[:, D * lags:-1]
+            bs[k] = Wk[:, -1]
+
+            # Solve for the MAP estimate of the covariance
+            EWxyT =  Wk @ ExuyTs[k]
+            sqerr = EyyTs[k] - EWxyT.T - EWxyT + Wk @ ExuxuTs[k] @ Wk.T
+            nu = self.nu0 + Ens[k]
+            Sigmas[k] = (sqerr + self.Psi0) / (nu + D + 1)
+
+        # If any states are unused, set their parameters to a perturbation of a used state
+        unused = np.where(Ens < 1)[0]
+        used = np.where(Ens > 1)[0]
+        if len(unused) > 0:
+            for k in unused:
+                i = npr.choice(used)
+                As[k] = As[i] + 0.01 * npr.randn(*As[i].shape)
+                Vs[k] = Vs[i] + 0.01 * npr.randn(*Vs[i].shape)
+                bs[k] = bs[i] + 0.01 * npr.randn(*bs[i].shape)
+                Sigmas[k] = Sigmas[i]
+
+        # Update parameters via their setter
+        self.As = As
+        self.Vs = Vs
+        self.bs = bs
+        self.Sigmas = Sigmas
+
+    def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
+        D, As, bs, Vs = self.D, self.As, self.bs, self.Vs
+        #print("Sample cycled")
+        if xhist.shape[0] < self.lags:
+            # Sample from the initial distribution
+            S = np.linalg.cholesky(self.Sigmas_init[z]) if with_noise else 0
+            return self.mu_init[z] + np.dot(S, npr.randn(D))
+        else:
+            # Sample from the autoregressive distribution
+            mu = Vs[z].dot(input[:self.M]) + bs[z]
+            for l in range(self.lags):
+                Al = As[z][:,l*D:(l+1)*D]
+                mu += Al.dot(xhist[-l-1]) + Al.dot(xhist[-l])
+
+            S = np.linalg.cholesky(self.Sigmas[z]) if with_noise else 0
+            return mu + np.dot(S, npr.randn(D))
+
+    def neg_hessian_expected_log_dynamics_prob(self, Ez, data, input, mask, tag=None):
+        assert np.all(mask), "Cannot compute negative Hessian of autoregressive obsevations with missing data."
+        assert self.lags == 1, "Does not compute negative Hessian of autoregressive observations with lags > 1"
+
+        # initial distribution contributes a Gaussian term to first diagonal block
+        J_ini = np.sum(Ez[0, :, None, None] * np.linalg.inv(self.Sigmas_init), axis=0)
+
+        # first part is transition dynamics - goes to all terms except final one
+        # E_q(z) x_{t} A_{z_t+1}.T Sigma_{z_t+1}^{-1} A_{z_t+1} x_{t}
+        inv_Sigmas = np.linalg.inv(self.Sigmas)
+        dynamics_terms = np.array([A.T@inv_Sigma@A for A, inv_Sigma in zip(self.As, inv_Sigmas)]) # A^T Qinv A terms
+        J_dyn_11 = np.sum(Ez[1:,:,None,None] * dynamics_terms[None,:], axis=1)
+
+        # second part of diagonal blocks are inverse covariance matrices - goes to all but first time bin
+        # E_q(z) x_{t+1} Sigma_{z_t+1}^{-1} x_{t+1}
+        J_dyn_22 = np.sum(Ez[1:,:,None,None] * inv_Sigmas[None,:], axis=1)
+
+        # lower diagonal blocks are (T-1,D,D):
+        # E_q(z) x_{t+1} Sigma_{z_t+1}^{-1} A_{z_t+1} x_t
+        off_diag_terms = np.array([inv_Sigma@A for A, inv_Sigma in zip(self.As, inv_Sigmas)])
+        J_dyn_21 = -1 * np.sum(Ez[1:,:,None,None] * off_diag_terms[None,:], axis=1)
+
+        return J_ini, J_dyn_11, J_dyn_21, J_dyn_22
 
 class AutoRegressiveObservationsNoInput(AutoRegressiveObservations):
     """
